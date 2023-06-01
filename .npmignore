@@ -1,5 +1,4 @@
-coverage
 src
 test
-.coveralls.yml
-.travis.yml
+.babelrc
+.github

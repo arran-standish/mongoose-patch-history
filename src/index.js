@@ -1,15 +1,6 @@
 import assert from 'assert'
 import jsonpatch from 'fast-json-patch'
-import { decamelize, pascalize } from 'humps'
-import { dropRightWhile, each, get, map, merge, omit, tail } from 'lodash'
-
-export const RollbackError = function (message, extra) {
-  Error.captureStackTrace(this, this.constructor)
-  this.name = 'RollbackError'
-  this.message = message
-}
-
-require('util').inherits(RollbackError, Error)
+import { each, get, merge, omit, tail } from 'lodash'
 
 const createPatchModel = (options) => {
   const def = {
@@ -22,12 +13,12 @@ const createPatchModel = (options) => {
     def[name] = omit(type, 'from')
   })
 
-  const PatchSchema = new options.mongoose.Schema(def)
+  const PatchSchema = new options.schema(def)
 
   return options.mongoose.model(
-    options.transforms[0](`${options.name}`),
+    options.name,
     PatchSchema,
-    options.transforms[1](`${options.name}`)
+    options.name[0].toLowerCase() + options.name.substring(1)
   )
 }
 
@@ -35,92 +26,8 @@ const defaultOptions = {
   includes: {},
   excludes: [],
   removePatches: true,
-  transforms: [pascalize, decamelize],
   trackOriginalValue: false,
 }
-
-const ARRAY_INDEX_WILDCARD = '*'
-
-/**
- * Splits a json-patch-path of form `/path/to/object` to an array `['path', 'to', 'object']`.
- * Note: `/` is returned as `[]`
- *
- * @param {string} path Path to split
- */
-const getArrayFromPath = (path) => path.replace(/^\//, '').split('/')
-
-/**
- * Checks the provided `json-patch-operation` on `excludePath`. This check joins the `path` and `value` property of the `operation` and removes any hit.
- *
- * @param {import('fast-json-patch').Operation} patch operation to check with `excludePath`
- * @param {String[]} excludePath Path to property to remove from value of `operation`
- *
- * @return `false` if `patch.value` is `{}` or `undefined` after remove, `true` in any other case
- */
-const deepRemovePath = (patch, excludePath) => {
-  const operationPath = sanitizeEmptyPath(getArrayFromPath(patch.path))
-
-  if (isPathContained(operationPath, excludePath)) {
-    let value = patch.value
-
-    // because the paths overlap start at patchPath.length
-    // e.g.: patch: { path:'/object', value:{ property: 'test' } }
-    // pathToExclude: '/object/property'
-    // need to start at array idx 1, because value starts at idx 0
-    for (let i = operationPath.length; i < excludePath.length - 1; i++) {
-      if (excludePath[i] === ARRAY_INDEX_WILDCARD && Array.isArray(value)) {
-        // start over with each array element and make a fresh check
-        // Note: it can happen that array elements are rendered to: {}
-        //         we need to keep them to keep the order of array elements consistent
-        value.forEach((elem) => {
-          deepRemovePath({ path: '/', value: elem }, excludePath.slice(i + 1))
-        })
-
-        // If the patch value has turned to {} return false so this patch can be filtered out
-        if (Object.keys(patch.value).length === 0) return false
-        return true
-      }
-      value = value[excludePath[i]]
-
-      if (typeof value === 'undefined') return true
-    }
-    if (typeof value[excludePath[excludePath.length - 1]] === 'undefined')
-      return true
-    else {
-      delete value[excludePath[excludePath.length - 1]]
-      // If the patch value has turned to {} return false so this patch can be filtered out
-      if (Object.keys(patch.value).length === 0) return false
-    }
-  }
-  return true
-}
-
-/**
- * Sanitizes a path `['']` to be used with `isPathContained()`
- * @param {String[]} path
- */
-const sanitizeEmptyPath = (path) =>
-  path.length === 1 && path[0] === '' ? [] : path
-
-// Checks if 'fractionPath' is contained in fullPath
-// Exp. 1: fractionPath '/path/to',              fullPath '/path/to/object'       => true
-// Exp. 2: fractionPath '/arrayPath/*/property', fullPath '/arrayPath/1/property' => true
-const isPathContained = (fractionPath, fullPath) =>
-  fractionPath.every(
-    (entry, idx) =>
-      entryIsIdentical(entry, fullPath[idx]) ||
-      matchesArrayWildcard(entry, fullPath[idx])
-  )
-
-const entryIsIdentical = (entry1, entry2) => entry1 === entry2
-
-const matchesArrayWildcard = (entry1, entry2) =>
-  isArrayIndexWildcard(entry1) && isIntegerGreaterEqual0(entry2)
-
-const isArrayIndexWildcard = (entry) => entry === ARRAY_INDEX_WILDCARD
-
-const isIntegerGreaterEqual0 = (entry) =>
-  Number.isInteger(Number(entry)) && Number(entry) >= 0
 
 // used to convert bson to json - especially ObjectID references need
 // to be converted to hex strings so that the jsonpatch `compare` method
@@ -147,9 +54,6 @@ export default function (schema, opts) {
   // get _id type from schema
   options._idType = schema.tree._id.type
 
-  // transform excludes option
-  options.excludes = options.excludes.map(getArrayFromPath)
-
   // validate parameters
   assert(options.mongoose, '`mongoose` option must be defined')
   assert(options.name, '`name` option must be defined')
@@ -171,49 +75,6 @@ export default function (schema, opts) {
         }
       },
     })
-  }
-
-  // roll the document back to the state of a given patch id()
-  schema.methods.rollback = function (patchId, data, save = true) {
-    return this.patches
-      .find({ ref: this.id })
-      .sort({ date: 1 })
-      .exec()
-      .then(
-        (patches) =>
-          new Promise((resolve, reject) => {
-            // patch doesn't exist
-            if (!~map(patches, 'id').indexOf(patchId)) {
-              return reject(new RollbackError("patch doesn't exist"))
-            }
-
-            // get all patches that should be applied
-            const apply = dropRightWhile(
-              patches,
-              (patch) => patch.id !== patchId
-            )
-
-            // if the patches that are going to be applied are all existing patches,
-            // the rollback attempts to rollback to the latest patch
-            if (patches.length === apply.length) {
-              return reject(new RollbackError('rollback to latest patch'))
-            }
-
-            // apply patches to `state`
-            const state = {}
-            apply.forEach((patch) => {
-              jsonpatch.applyPatch(state, patch.ops, true)
-            })
-
-            // set new state
-            this.set(merge(data, state))
-
-            // in case of save, save it back to the db and resolve
-            if (save) {
-              this.save().then(resolve).catch(reject)
-            } else resolve(this)
-          })
-      )
   }
 
   // create patch model, enable static model access via `Patches` and
@@ -259,16 +120,6 @@ export default function (schema, opts) {
       document.isNew ? {} : document._original || {},
       toJSON(document.data())
     )
-    if (options.excludes.length > 0) {
-      ops = ops.filter((op) => {
-        const pathArray = getArrayFromPath(op.path)
-        return (
-          !options.excludes.some((exclude) =>
-            isPathContained(exclude, pathArray)
-          ) && options.excludes.every((exclude) => deepRemovePath(op, exclude))
-        )
-      })
-    }
 
     // don't save a patch when there are no changes to save
     if (!ops.length) {
